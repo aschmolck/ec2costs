@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+import sys
+from collections import Counter, namedtuple
+import datetime as dt
+from enum import Enum
+from itertools import groupby, starmap
+import jmespath
+import json
+import os
+import pkg_resources
+import re
+import time
+import typing
+
+import altair as alt
+import boto3
+
+
+GOOD_EC2_MAX_USD_PER_MONTH = 2000
+
+
+class enum(Enum):
+    def __repr__(self):
+        return super().__repr__().split(":")[0][1:]
+
+    def __str__(self):
+        return self.name
+
+
+InstState = enum(
+    "InstState", "pending running stopping stopped shutting_down terminated"
+)
+
+
+# Map from volume type code # Map from region_code to the description name that pricing api uses.
+REGIONS = {
+    k: v["description"]
+    for k, v in json.loads(pkg_resources.resource_string("boto", "endpoints.json"))[
+        "partitions"
+    ][0]["regions"].items()
+}
+
+
+class ec2(typing.NamedTuple):
+    it: str
+    region: str
+    tenancy: str  # FIXME
+    usd: float  # per 30d
+    mem: float
+    net: str
+    ebs: typing.Optional[str]
+    ecu: typing.Optional[float]
+    vcpu: int
+    cpu: str
+    clock: str
+    features: str
+
+    @property
+    def mem_per_buck(self):
+        "Really: mem_per_buck_per_day; gives convenient normalization"
+        return self.mem / (self.usd / 1)
+
+    @property
+    def ecu_per_buck(self):
+        ecu = float("nan") if self.ecu is None else self.ecu
+        return ecu / (self.usd / 1)
+
+    def ecu_str(self):
+        return str(self.ecu) if self.ecu is not None else "n/a"
+
+    def mem_str(self):
+        full = int(self.mem)
+        frac = self.mem - full
+        return str(full) + {0: " ", 0.25: "¼", 0.5: "½", 0.75: "¾"}[frac]
+
+
+def fields(**kwargs):
+    return tuple((k, v) for k, v in kwargs.items() if v is not None)
+
+
+def ec2_filter(region, instance_type=None, os="Linux"):
+    return fields(
+        instanceType=instance_type,
+        location=REGIONS[region],
+        operatingSystem=os,
+        #        tenancy="shared",
+        preInstalledSw="NA",
+        capacitystatus="Used",
+    )
+
+
+def ebs_filter(region, volume=None):
+    return fields(
+        location=REGIONS[region], productFamily="Storage", volumeApiName=volume
+    )
+
+
+def iops_filter(region):
+    return fields(location=REGIONS[region], group="EBS IOPS")
+
+
+def extract_price(pricing_info):
+    query = (
+        "values(terms.OnDemand)[].priceDimensions|[0]|values(@)|[0].pricePerUnit.USD"
+    )
+    return float(jmespath.search(query, pricing_info))
+
+
+# return pricing_client.get_products(ServiceCode="AmazonEC2", Filters=fs)
+def pricing_request(filters):
+    fs = [{"Field": k, "Value": v, "Type": "TERM_MATCH"} for k, v in filters]
+    return [
+        json.loads(pl_item)
+        for page in pricing_client.get_paginator("get_products").paginate(
+            ServiceCode="AmazonEC2", Filters=fs
+        )
+        for pl_item in page["PriceList"]
+    ]
+
+
+def monthly_ebs_dollars(region: str, volume: str, gb: int) -> float:
+    return ebss[region][volume].usd * gb
+
+
+# Get current AWS price for an on-demand ec2 instance
+
+
+def monthly_ec2_dollars(region: str, instance_type: str, tenancy: str = "default"):
+    # NB: 30, not 365 / 12: AWS uses 30 day months, 1% error
+    return ec2s[region][{"default": "Shared"}.get(tenancy, tenancy)][instance_type].usd
+
+
+def monthly_iops_dollars(region: str, iops: int) -> float:
+    return iopss[region] * iops
+
+
+def get_zone_mapping() -> typing.Dict[str, str]:
+    return dict(
+        jmespath.search(
+            "AvailabilityZones[].[ZoneName, RegionName]",
+            ec2_client.describe_availability_zones(AllAvailabilityZones=True),
+        )
+    )
+
+
+class Inst(typing.NamedTuple):
+    id: str
+    grouping: typing.List[str]
+    state: str  # InstState
+    type: str
+    az: str
+    tenancy: str  # FIXME
+    vols: typing.List[str]
+    launched: str
+    tags: typing.List[str]
+
+    @classmethod
+    def _from_api_query(cls, args):
+        x = cls(*args)
+        # datetime awkward, use str
+        return x._replace(launched=x.launched.isoformat())
+
+
+def get_instance_data(grouping_tags: typing.Tuple[str, str]):
+
+    grouper = ",".join(f"Tags[?Key==`{t}`][].Value|[0]" for t in grouping_tags)
+    query = (
+        "Reservations[].Instances[].["
+        " InstanceId,"
+        " [%s],"
+        " State.Name,"
+        " InstanceType,"
+        " Placement.AvailabilityZone,"
+        " Tenancy,"
+        " BlockDeviceMappings[?Ebs!=null][].Ebs.VolumeId,"
+        " LaunchTime,"
+        " Tags[].[@.Key, @.Value]"
+        "]" % grouper
+    )  # SecurityGroups[].[@.GroupName]
+    return list(
+        map(
+            Inst._from_api_query,
+            jmespath.search(query, ec2_client.describe_instances()),
+        )
+    )
+
+
+def ec2_types(regions):
+    return {region: region_ec2_types(region) for region in regions}
+
+
+def region_ec2_types(region):
+    prices = pricing_request(ec2_filter(region))
+    usd = map(extract_price, prices)
+    meta = zip(
+        jmespath.search(
+            "[*].product.attributes.["
+            " tenancy, instanceType,"
+            " memory, networkPerformance, dedicatedEbsThroughput,"
+            " to_number(ecu), to_number(vcpu), physicalProcessor, clockSpeed, processorFeatures]",
+            prices,
+        ),
+        usd,
+    )
+    return {
+        tenancy: {
+            it: ec2(
+                it,
+                region,
+                tenancy,
+                usd * 24 * 30,
+                float(re.sub(" GiB$", "", mem)),
+                net,
+                ebs,
+                ecu,
+                vcpu,
+                cpu,
+                clock,
+                features,
+            )
+            for (tenancy, it, mem, net, ebs, ecu, vcpu, cpu, clock, features), usd in g
+        }
+        for tenancy, g in groupby(sorted(meta), lambda x: x[0][0])
+    }
+
+
+def unlist(x):
+    [x] = x
+    return x
+
+
+def iops_prices(regions):
+    return {r: extract_price(unlist(pricing_request(iops_filter(r)))) for r in regions}
+
+
+class Ebs(typing.NamedTuple):
+    type: str
+    usd: float
+    max_size: str
+    max_throughput: str
+    max_iops: str
+
+
+def ebs_types(regions):
+    return {region: region_ebs_types(region) for region in regions}
+
+
+def region_ebs_types(region):
+    prices = pricing_request(ebs_filter(region))
+    usd = map(extract_price, prices)
+    ans = {}
+    for id, max_size, max_throughput, max_iops in jmespath.search(
+        "[*].product.attributes.[volumeApiName, maxVolumeSize, maxThroughputvolume, maxIopsvolume]",
+        prices,
+    ):
+        ans[id] = Ebs(id, next(usd), max_size, max_throughput, max_iops)
+    return ans
+
+
+class Vol(typing.NamedTuple):
+    id: str
+    state: str
+    type: str
+    gb: float
+    iops: float
+
+
+def get_ebs_data():
+    query = "Volumes[].[VolumeId,State,VolumeType,Size,Iops]"
+    resp = jmespath.search(query, ec2_client.describe_volumes())
+    return {v[0]: Vol(*v) for v in resp}
+
+
+def monthly_volume_dollars(region):
+    def region_monthly_volume_dollars(volume_type, gb, iops):
+        return monthly_ebs_dollars(region, volume_type, gb) + (
+            monthly_iops_dollars(region, iops) if volume_type == "io1" else 0
+        )
+
+    return region_monthly_volume_dollars
+
+
+def yesterday_midnight_utc(today=None):
+    return dt.datetime.combine(
+        (today or dt.datetime.utcnow().date()) - dt.timedelta(days=1),
+        dt.datetime.min.time(),
+    )
+
+
+def percent_bar(x, ansi=True):
+    blocks = "▏▎▍▌▋▊▉█"
+    # round to avoid errors due to small precision issues in assert
+    x = round(x)
+    assert 0 <= x <= 100
+    w = round(0.4 * x)
+    full, frac = divmod(w, 8)
+    frac_str = blocks[frac - 1] if frac else ""
+    if x < 50:
+        return f"{full * blocks[-1]}{frac_str}{x:{5-full}}"
+    ion, ioff = ("\33[7m", "\33[27m") if ansi else ("", "")
+    return f"{ion}{x:<{full}}{ioff}{frac_str}"
+
+
+def utilizations(
+    instances, start=None, end=None, period=60 * 5, metric="CPUUtilization"
+):
+    end = end or yesterday_midnight_utc()
+    start = end - dt.timedelta(days=1)
+    return [utilization(i.id, start, end, period, metric) for i in instances]
+
+
+# ∅⌈ ∨
+def utilization(instance_id, start, end, period, metric):
+    now = datetime.datetime.utcnow()
+    ds = cloudwatch_client.get_metric_statistics(
+        Namespace="AWS/EC2",
+        MetricName=metric,
+        Dimensions=[{"Name": "InstanceId", "Value": instance_id}],
+        StartTime=start,
+        EndTime=end,
+        Period=period,
+        Statistics=["Maximum", "Average"],
+        Unit="Percent",
+    )["Datapoints"]
+    return [
+        dict(
+            ts=d["Timestamp"].replace(tzinfo=None).isoformat(),
+            mean=d["Average"],
+            max=d["Maximum"],
+        )
+        for d in ds
+    ]
+
+
+def dominates(a, b):
+    return all(x >= y for (x, y) in zip(a[1:], b[1:])) and a[1:] != b[1:]
+
+
+def dumb_pareto(items):
+    items = list(items)
+    j = 0
+    while j < len(items):
+        i = j
+        while i < len(items):
+            if dominates(items[j], items[i]):
+                del items[i]
+            elif dominates(items[i], items[j]):
+                items[i], items[j] = items[j], items[i]
+                i = j
+            else:
+                i += 1
+        j += 1
+    for item in items:
+        for other_item in items:
+            assert item == other_item or not dominates(item, other_item)
+    return items
+
+
+assert dumb_pareto([(1, 2, 3)]) == [(1, 2, 3)]
+assert dumb_pareto([(1, 2, 2), (1, 2, 1)]) == [(1, 2, 2)]
+assert dumb_pareto([(1, 2, 3), (1, 3, 2)]) == [(1, 2, 3), (1, 3, 2)]
+
+
+def pareto_front(pop_dict, metric):
+    return {k: v for k, *v in dumb_pareto((k,) + metric(pop_dict[k]) for k in pop_dict)}
+
+
+def tic():
+    global _T
+    _T = time.time()
+
+
+def toc(s=""):
+    global _T
+    old = _T
+    _T = time.time()
+    print(f"{s:20}took {_T-old:7.3f}s")
+
+
+def parse(argv):
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        argv,
+        description="Provide breakdown of EC2 costs grouped by (two) tags for default aws account.",
+    )
+    parser.add_argument(
+        "tags",
+        action="store",
+        type=str,
+        help="Comma seperated EC2 tags to group output by",
+        default="team,purpose",
+    )
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    tags = parse(sys.argv).tags.split(",")
+    assert len(tags) == 2, "Currently need to supply exactly two tags"
+    CACHE = os.getenv("XDG_HOME", os.path.expanduser("~/.config")) + f"ec2costs/cache"
+    tic()
+    # Why us-east-1? Well, the pricing service is only available in 2 regions.
+    pricing_client = boto3.client("pricing", region_name="us-east-1")
+    ec2_client = boto3.client("ec2")
+    ec2_client_region = ec2_client._client_config.region_name
+    cloudwatch_client = boto3.client("cloudwatch")
+
+    toc("clients")
+    ec2_client_account_id = boto3.client("sts").get_caller_identity().get("Account")
+    toc("account")
+    cache_file = f"{CACHE}/{ec2_client_account_id}-{ec2_client_region}5.json"
+    if os.path.exists(cache_file):
+        with open(cache_file) as fh:
+            data = json.load(fh)
+            ec2s = {
+                r: {t: {it: ec2(*v) for it, v in tv.items()} for t, tv in rv.items()}
+                for r, rv in data["instance_types"].items()
+            }
+            ebss = {
+                r: {k: Ebs(*v) for k, v in rv.items()}
+                for r, rv in data["volume_types"].items()
+            }
+            iopss = data["iops_prices"]
+            ZONE_TO_REGION = data["zone_to_region"]
+            my_instances = list(starmap(Inst, data["instances"]))
+            my_volumes = {k: Vol(*v) for k, v in data["volumes"].items()}
+    else:
+        ZONE_TO_REGION = get_zone_mapping()
+        toc("Zones")
+        my_instances = sorted(
+            get_instance_data(tags), key=lambda r: list(map(str, r[1:2]))
+        )
+        my_regions = {ZONE_TO_REGION[inst.az] for inst in my_instances}
+        toc("Instances")
+        ebss = ebs_types(my_regions)
+        toc("EBS types")
+        iopss = iops_prices(my_regions)
+        toc("IOPS prices")
+        ec2s = ec2_types(my_regions)
+        toc("EC2 types")
+
+        my_volumes = get_ebs_data()
+        toc("Volumes")
+        os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+        with open(cache_file, "w") as fh:
+            # avoid json.dump to avoid half-written file on encoding error
+            fh.write(
+                json.dumps(
+                    {
+                        "timestamp": time.time(),
+                        "instance_types": ec2s,
+                        "volume_types": ebss,
+                        "iops_prices": iopss,
+                        "account_id": ec2_client_account_id,
+                        "region": ec2_client_region,
+                        "instances": my_instances,
+                        "volumes": my_volumes,
+                        "zone_to_region": ZONE_TO_REGION,
+                    }
+                )
+            )
+
+    def pretty_vol_infos(volume_infos, max_strlen=25):
+        strlen = 0
+        info_groups = [
+            (k, list(g))
+            for k, g in groupby(
+                volume_infos,
+                lambda vi: (vi.type, vi.gb, vi.iops if vi.type == "io1" else None),
+            )
+        ]
+        for (i, ((t, gb, iops), g)) in enumerate(info_groups):
+            n = len(g)
+            mul = f"{n}×" if n != 1 else ""
+            iops = f"@{iops}" if t == "io1" else ""
+            vol_info = f"{mul}{gb}G{iops}"
+            left_info = f"{len(info_groups)-i} more"
+            if strlen + len(vol_info) + 1 > max_strlen - len(left_info) and not (
+                left_info == "1 more" and strlen + len(vol_info) + 1 <= max_strlen
+            ):
+                yield left_info
+                break
+            strlen += len(vol_info) + 1
+            yield vol_info
+
+    grand_ec2 = grand_vol = grand_ssd = 0.0
+    e = ""  # template dummy for easier alignment
+    instance_types: typing.Counter[str] = Counter()
+    regions: typing.Counter[str] = Counter()
+    grand_ecus = grand_gb = grand_vcpu = 0.0
+    for team, raw_g_it in groupby(my_instances, lambda k: k[1][0]):
+        team = team or "???"
+        print(f"=== {team}")
+        team_total = team_vol = team_ec2 = 0.0
+        raw_g = list(raw_g_it)
+
+        def replace_ids_with_specs(inst):
+            return (
+                inst.grouping,
+                inst.state,
+                inst.type,
+                ZONE_TO_REGION[inst.az],
+                sorted([my_volumes[vol]._replace(id=None) for vol in inst.vols]),
+            )
+
+        for ([team, purpose], state, instance_type, region, volume_infos), g in groupby(
+            map(replace_ids_with_specs, raw_g)
+        ):
+            if state != "running":
+                continue
+            # if purpose.startswith("eks"):
+            #     continue
+
+            n = len(list(g))
+            purpose = purpose or "???"
+
+            instance_types[instance_type] += n
+            regions[region] += n
+            monthly_ec2 = monthly_ec2_dollars(region, instance_type)
+            vol_prices = [
+                monthly_volume_dollars(region)(vi.type, vi.gb, vi.iops)
+                for vi in volume_infos
+            ]
+
+            vol = "+".join(
+                pretty_vol_infos(
+                    [
+                        v
+                        for _p, v in sorted(
+                            list(zip(vol_prices, volume_infos)), reverse=True
+                        )
+                    ]
+                )
+            )
+            grand_ssd += sum(v.gb for v in volume_infos)
+            monthly_vol = sum(vol_prices)
+            team_vol += n * monthly_vol
+            team_ec2 += n * monthly_ec2
+            print(
+                # fmt: off
+                f"{purpose:35} {n:3} × (({instance_type:10} = {monthly_ec2:8.2f}$) + ({vol:25} = {monthly_vol:8.2f}$)) = {n * (monthly_ec2+monthly_vol):8.2f}$"
+                if n != 1 else
+                f"{purpose:35} {e:3}    ({instance_type:10} = {monthly_ec2:8.2f}$) + ({vol:25} = {monthly_vol:8.2f}$)  = {n * (monthly_ec2+monthly_vol):8.2f}$"
+            )
+            instance_type_ = ec2s[region]["Shared"][instance_type]
+            grand_ecus += n * (instance_type_.ecu or instance_type_.vcpu * 2)
+            grand_gb += n * instance_type_.mem
+            grand_vcpu += n * instance_type_.vcpu
+        team_total = team_vol + team_ec2
+        print(
+            f"  {'TOTAL':35} {e:3}     {e            :10}   {team_ec2   :8.2f}$  +  {e  :25}   {team_vol   :8.2f}$   = {team_total:8.2f}$".lstrip()
+        )
+        print()
+        grand_ec2 += team_ec2
+        grand_vol += team_vol
+    grand_total = grand_ec2 + grand_vol
+    print(
+        f"      {'GRAND TOTAL':35} {e:3}      {e           :10}   {grand_ec2   :8.2f}$ +  {e  :25}   {grand_vol  :8.2f}$   = {grand_total:8.2f}$".lstrip()
+    )
+
+    [(region, _)] = regions.most_common(1)
+
+    print()
+    print()
+    print(
+        f"=== 30 Day Disk Prices for {region} (also see <https://aws.amazon.com/ebs/pricing/#Pricing_calculator>"
+    )
+    print(
+        f"100GiB sc1 (slow spinning rust)  = {monthly_volume_dollars(region)('sc1', 100, None):6.2f}$, gives 300 IOPS = 1024KiB reads or writes"
+    )
+    print(
+        f"100GiB st1 (fast spinning rust)  = {monthly_volume_dollars(region)('st1', 100, None):6.2f}$, gives 300 IOPS = 1024KiB reads or writes"
+    )
+    print(
+        f"100GiB gp2 (general purpose SSD) = {monthly_volume_dollars(region)('gp2', 100, None):6.2f}$, gives 300 IOPS = 256KiB reads or writes (non random 32KiB chunks can be batched)"
+    )
+    print(
+        f"100GiB io1 (paying for 300 IOPS) = {monthly_volume_dollars(region)('io1', 100, 300):6.2f}$, gives 300 IOPS = 256KiB reads or writes (non random 32KiB chunks can be batched)"
+    )
+    print(
+        f" 10GiB io1 (paying for 300 IOPS) = {monthly_volume_dollars(region)('io1',  10, 300):6.2f}$, gives 300 IOPS = 256KiB reads or writes (non random 32KiB chunks can be batched)"
+    )
+    print(
+        f"So io1 is *insanely* expensive: even 10GiB at 300 IOPs would be some integer factor above gp2 for 100GiB and same IOPS"
+    )
+    print(
+        f"(For io1, each GiB costs you {monthly_ebs_dollars(region, 'io1', 1):5.3f} and you ADDITIONALLY pay {monthly_iops_dollars(region, 1):5.2f}$ per IOP capacity; only use if you exceed gp2 max IOPS or throughput)"
+    )
+    print(
+        f"(For gp2, each GiB costs you {monthly_ebs_dollars(region, 'gp2', 1):5.3f} and gives you 3 IOPs capacity for free)"
+    )
+    print()
+    print(
+        f"=== 30 Day EC2 instance prices for {region} (see <https://calculator.aws/#/estimate?id=65d1a9b9e7d75f6432b9b9aafb3d0aa380256f0d> for eu-west-1 example)"
+    )
+    print(
+        f"==== You are using the following instance types (costs for {ec2_client_region})"
+    )
+    for it, n in instance_types.most_common():
+        inst = ec2s[region]["Shared"][it]
+        print(
+            f"{n:3} {inst.it:15} {inst.vcpu:2} {inst.ecu_str():4} ECU {inst.ecu_per_buck:5.2f}ECU/$/d {inst.mem_str()}GiB {inst.mem_per_buck:5.2f}GiB/$/d {inst.usd:7.2f}$ each, {n*inst.usd:7.2f}$ total"
+        )
+
+    good_ec2s = [
+        ec2
+        for ec2 in ec2s[ec2_client_region]["Shared"].values()
+        if ec2.ecu and ec2.usd < GOOD_EC2_MAX_USD_PER_MONTH
+    ]
+    import pandas as pd
+
+    df = pd.DataFrame(
+        [
+            [
+                x.it,
+                round(typing.cast(float, x.ecu) / (x.usd / 1), 2),
+                round(x.mem / (x.usd / 1), 2),
+                x.usd,
+                x.vcpu,
+                x.ecu,
+                x.mem,
+                round((x.ecu or float("nan")) / x.vcpu, 1),
+                x.net,
+            ]
+            for x in good_ec2s
+        ],
+        columns="it ecu_per_buck mem_per_buck usd vcpu ecu mem ecu_per_vcpu net".split(),
+    )
+    print()
+    print(
+        f"==== Best bang for buck compute ({ec2_client_region}, <{GOOD_EC2_MAX_USD_PER_MONTH}$/month)"
+    )
+    cpu_buck = df.sort_values(by="ecu_per_buck", ascending=False).reset_index(drop=1)
+    print(cpu_buck.head(20).to_string())
+
+    print()
+    print(
+        f"==== Best bang for buck memory ({ec2_client_region}, <{GOOD_EC2_MAX_USD_PER_MONTH}$/month)"
+    )
+
+    mem_buck = df.sort_values(by="mem_per_buck", ascending=False).reset_index(drop=1)
+    print(mem_buck.head(20).to_string())
+    print()
+    print(
+        f"==== Pareto optimal instance types ({ec2_client_region}, <{GOOD_EC2_MAX_USD_PER_MONTH}$/month)"
+    )
+    optimal = set(
+        pareto_front(
+            {x.it: x for x in good_ec2s},
+            lambda v: (
+                round((v.ecu or 0) / (v.usd / 1), 3),
+                round(v.mem / (v.usd / 1), 3),
+                v.ecu,
+                # v.vcpu,
+                v.mem,
+                # v.usd,
+            ),
+        )
+    )
+    mem_buck["rrank"] = len(mem_buck) - mem_buck.index.array
+    cpu_buck["rrank"] = len(cpu_buck) - cpu_buck.index.array
+    pareto_buck = df.set_index("it").loc[optimal].copy()
+    pareto_buck["rrank"] = (
+        mem_buck.set_index("it").loc[optimal].rrank
+        + cpu_buck.set_index("it").loc[optimal].rrank
+    )
+    print(
+        pareto_buck.sort_values(by="rrank", ascending=False).reset_index().to_string()
+    )
+
+    import pandas as pd
+
+    our_ec2s = pd.DataFrame(
+        (
+            lambda x: dict(
+                x._asdict(),
+                mem_per_buck=x.mem_per_buck,
+                ecu_per_buck=x.ecu_per_buck,
+                n=n,
+            )
+        )(ec2s[region]["Shared"][k])
+        for k, n in instance_types.items()
+    )
+    # %alt.renderers.enable('mimetype')
+    # %%
+    alt.Chart(our_ec2s).mark_circle(size=60).encode(
+        x="mem_per_buck",
+        y="ecu_per_buck",
+        color="usd",
+        size="n",
+        tooltip=list(our_ec2s.columns),
+    ).interactive()
