@@ -17,7 +17,7 @@ import botocore
 import boto3
 
 
-GOOD_EC2_MAX_USD_PER_MONTH = 20000
+GOOD_EC2_MAX_USD_PER_MONTH = 5000
 
 
 class enum(Enum):
@@ -157,10 +157,12 @@ class Inst(typing.NamedTuple):
     def _from_api_query(cls, args):
         x = cls(*args)
         # datetime awkward, use str
-        return x._replace(launched=x.launched.isoformat())
+        if isinstance(x.launched, dt.datetime):
+            x = x._replace(launched=x.launched.isoformat())
+        return x
 
 
-def get_instance_data(grouping_tags: typing.Tuple[str, str]):
+def grouped_instances(raw_instances, grouping_tags: typing.Tuple[str, str]):
     grouper = ",".join(f"Tags[?Key==`{t}`][].Value|[0]" for t in grouping_tags)
     query = (
         "Reservations[].Instances[].["
@@ -175,11 +177,10 @@ def get_instance_data(grouping_tags: typing.Tuple[str, str]):
         " Tags[].[@.Key, @.Value]"
         "]" % grouper
     )  # SecurityGroups[].[@.GroupName]
-    instances = ec2_client.describe_instances()
     return list(
         map(
             Inst._from_api_query,
-            jmespath.search(query, instances),
+            jmespath.search(query, raw_instances),
         )
     )
 
@@ -314,9 +315,8 @@ def utilizations(
     return [utilization(i.id, start, end, period, metric) for i in instances]
 
 
-# ∅⌈ ∨
 def utilization(instance_id, start, end, period, metric):
-    now = datetime.datetime.utcnow()
+    now = dt.datetime.utcnow()
     ds = cloudwatch_client.get_metric_statistics(
         Namespace="AWS/EC2",
         MetricName=metric,
@@ -399,14 +399,14 @@ def parse(argv):
     return parser.parse_args()
 
 
-def cached_client(service, profile=None):
+def cached_client(service, profile=None, region=None):
     cache = os.path.join(os.path.expanduser("~"), ".aws/cli/cache")
     provider = botocore.session.Session(profile=profile)
     provider.get_component("credential_provider").get_provider(
         "assume-role"
     ).cache = botocore.credentials.JSONFileCache(cache)
 
-    return boto3.Session(botocore_session=provider).client(service)
+    return boto3.Session(botocore_session=provider).client(service, region_name=region)
 
 
 if __name__ == "__main__":
@@ -415,9 +415,7 @@ if __name__ == "__main__":
     CACHE = os.getenv("XDG_HOME", os.path.expanduser("~/.config")) + f"ec2costs/cache"
     tic()
     # Why us-east-1? Well, the pricing service is only available in 2 regions.
-    pricing_client = boto3.Session(profile_name="default").client(
-        "pricing", region_name="us-east-1"
-    )
+    pricing_client = cached_client("pricing", profile="default", region="us-east-1")
     ec2_client = cached_client("ec2")
     ec2_client_region = ec2_client._client_config.region_name
     cloudwatch_client = cached_client("cloudwatch")
@@ -426,7 +424,7 @@ if __name__ == "__main__":
     ec2_client_account_id = cached_client("sts").get_caller_identity().get("Account")
     toc("account")
     cache_file = f"{CACHE}/{ec2_client_account_id}-{ec2_client_region}5.json"
-    if False and os.path.exists(cache_file):
+    if os.path.exists(cache_file):
         with open(cache_file) as fh:
             data = json.load(fh)
             ec2s = {
@@ -439,15 +437,24 @@ if __name__ == "__main__":
             }
             iopss = data["iops_prices"]
             ZONE_TO_REGION = data["zone_to_region"]
-            my_instances = list(starmap(Inst, data["instances"]))
             my_volumes = {k: Vol(*v) for k, v in data["volumes"].items()}
+            raw_instances = data["instances"]
     else:
         ZONE_TO_REGION = get_zone_mapping()
         toc("Zones")
-        my_instances = sorted(
-            get_instance_data(tags), key=lambda r: list(map(str, r[1:2]))
+        # Hack: to and from json to get rid of annoying datetimes, probably there's a better way.
+        raw_instances = json.loads(
+            json.dumps(
+                ec2_client.describe_instances(), default=lambda dt: dt.isoformat()
+            )
         )
-        my_regions = {ZONE_TO_REGION[inst.az] for inst in my_instances}
+
+        def get_azs(raw_instances):
+            return jmespath.search(
+                "Reservations[].Instances[].Placement.AvailabilityZone", raw_instances
+            )
+
+        my_regions = {ZONE_TO_REGION[az] for az in get_azs(raw_instances)}
         toc("Instances")
         ebss = ebs_types(my_regions)
         toc("EBS types")
@@ -470,12 +477,15 @@ if __name__ == "__main__":
                         "iops_prices": iopss,
                         "account_id": ec2_client_account_id,
                         "region": ec2_client_region,
-                        "instances": my_instances,
+                        "instances": raw_instances,
                         "volumes": my_volumes,
                         "zone_to_region": ZONE_TO_REGION,
                     }
                 )
             )
+    my_instances = sorted(
+        grouped_instances(raw_instances, tags), key=lambda r: list(map(str, r[1:2]))
+    )
 
     def pretty_vol_infos(volume_infos, max_strlen=25):
         strlen = 0
@@ -512,12 +522,18 @@ if __name__ == "__main__":
         raw_g = list(raw_g_it)
 
         def replace_ids_with_specs(inst):
+            vols = inst.vols[:]
+            bad_vols = set(vols) - set(my_volumes)
+            if bad_vols:
+                vols = [vol for vol in vols if vol not in bad_vols]
+                print("Unknown vols for {inst=} {bad_vols}", file=sys.stderr)
+
             return (
                 inst.grouping,
                 inst.state,
                 inst.type,
                 ZONE_TO_REGION[inst.az],
-                sorted([my_volumes[vol]._replace(id=None) for vol in inst.vols]),
+                sorted([my_volumes[vol]._replace(id=None) for vol in vols]),
             )
 
         for ([team, purpose], state, instance_type, region, volume_infos), g in groupby(
@@ -555,9 +571,9 @@ if __name__ == "__main__":
             team_ec2 += n * monthly_ec2
             print(
                 # fmt: off
-                f"{purpose:35} {n:3} × (({instance_type:10} = {monthly_ec2:8.2f}$) + ({vol:25} = {monthly_vol:8.2f}$)) = {n * (monthly_ec2+monthly_vol):8.2f}$"
+                f"{purpose:37} {n:3} × (({instance_type:12} = {monthly_ec2:9.2f}$) + ({vol:27} = {monthly_vol:9.2f}$)) = {n * (monthly_ec2+monthly_vol):9.2f}$"
                 if n != 1 else
-                f"{purpose:35} {e:3}    ({instance_type:10} = {monthly_ec2:8.2f}$) + ({vol:25} = {monthly_vol:8.2f}$)  = {n * (monthly_ec2+monthly_vol):8.2f}$"
+                f"{purpose:37} {e:3}    ({instance_type:12} = {monthly_ec2:9.2f}$) + ({vol:27} = {monthly_vol:9.2f}$)  = {n * (monthly_ec2+monthly_vol):9.2f}$"
             )
             instance_type_ = ec2s[region]["Shared"][instance_type]
             grand_ecus += n * (instance_type_.ecu or instance_type_.vcpu * 2)
@@ -565,14 +581,14 @@ if __name__ == "__main__":
             grand_vcpu += n * instance_type_.vcpu
         team_total = team_vol + team_ec2
         print(
-            f"  {'TOTAL':35} {e:3}     {e            :10}   {team_ec2   :8.2f}$  +  {e  :25}   {team_vol   :8.2f}$   = {team_total:8.2f}$".lstrip()
+            f"  {'TOTAL':37} {e:3}     {e            :12}   {team_ec2   :9.2f}$  +  {e  :27}   {team_vol   :9.2f}$   = {team_total:9.2f}$".lstrip()
         )
         print()
         grand_ec2 += team_ec2
         grand_vol += team_vol
     grand_total = grand_ec2 + grand_vol
     print(
-        f"      {'GRAND TOTAL':35} {e:3}      {e           :10}   {grand_ec2   :8.2f}$ +  {e  :25}   {grand_vol  :8.2f}$   = {grand_total:8.2f}$".lstrip()
+        f"      {'GRAND TOTAL':37} {e:3}      {e           :12}   {grand_ec2   :9.2f}$ +  {e  :27}   {grand_vol  :9.2f}$   = {grand_total:9.2f}$".lstrip()
     )
 
     [(region, _)] = regions.most_common(1)
@@ -592,16 +608,16 @@ if __name__ == "__main__":
         f"100GiB gp2 (general purpose SSD) = {monthly_volume_dollars(region)('gp2', 100, None):6.2f}$, gives 300 IOPS = 256KiB reads or writes (non random 32KiB chunks can be batched)"
     )
     print(
-        f"100GiB gp3 (general purpose SSD) = {monthly_volume_dollars(region)('gp3', 100, None):6.2f}$, gives 3000 IOPS (FIXME details)"
+        f"100GiB gp3 (general purpose SSD) = {monthly_volume_dollars(region)('gp3', 100, None):6.2f}$, gives 3000 IOPS, faster and cheaper than gp2 "
     )
     print(
         f"100GiB io1 (paying for 300 IOPS) = {monthly_volume_dollars(region)('io1', 100, 300):6.2f}$, gives 300 IOPS = 256KiB reads or writes (non random 32KiB chunks can be batched)"
     )
     print(
-        f" 10GiB io2 (paying for 300 IOPS) = {monthly_volume_dollars(region)('io2',  10, 300):6.2f}$, gives 300 IOPS = 256KiB reads or writes (non random 32KiB chunks can be batched)"
+        f" 10GiB io1 (paying for 300 IOPS) = {monthly_volume_dollars(region)('io1',  10, 300):6.2f}$, gives 300 IOPS = 256KiB reads or writes (non random 32KiB chunks can be batched)"
     )
     print(
-        f"So io1 is *insanely* expensive: even 10GiB at 300 IOPs would be some integer factor above gp2 for 100GiB and same IOPS"
+        f"So io1 is *insanely* expensive: even 10GiB at 300 IOPs would be some integer factor above gp3 for 100GiB and same IOPS"
     )
     print(
         f"(For io1, each GiB costs you {monthly_ebs_dollars(region, 'io1', 1):5.3f} and you ADDITIONALLY pay {monthly_iops_dollars(region, 'io1', 1):5.2f}$ per IOP capacity; only use if you exceed gp2 max IOPS or throughput)"
@@ -630,6 +646,7 @@ if __name__ == "__main__":
         for ec2 in ec2s[ec2_client_region]["Shared"].values()
         if ec2.ecu and ec2.usd < GOOD_EC2_MAX_USD_PER_MONTH
     ]
+    sys.exit(0)
     import pandas as pd
 
     df = pd.DataFrame(
