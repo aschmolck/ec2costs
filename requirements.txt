@@ -1,0 +1,7 @@
+boto3
+altair
+jmespath
+# for development
+ipython
+black
+
