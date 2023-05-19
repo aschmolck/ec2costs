@@ -12,11 +12,12 @@ import re
 import time
 import typing
 
-import altair as alt
+# import altair as alt
+import botocore
 import boto3
 
 
-GOOD_EC2_MAX_USD_PER_MONTH = 2000
+GOOD_EC2_MAX_USD_PER_MONTH = 20000
 
 
 class enum(Enum):
@@ -35,9 +36,9 @@ InstState = enum(
 # Map from volume type code # Map from region_code to the description name that pricing api uses.
 REGIONS = {
     k: v["description"]
-    for k, v in json.loads(pkg_resources.resource_string("boto", "endpoints.json"))[
-        "partitions"
-    ][0]["regions"].items()
+    for k, v in json.loads(
+        pkg_resources.resource_string("botocore", "data/endpoints.json")
+    )["partitions"][0]["regions"].items()
 }
 
 
@@ -81,7 +82,7 @@ def fields(**kwargs):
 def ec2_filter(region, instance_type=None, os="Linux"):
     return fields(
         instanceType=instance_type,
-        location=REGIONS[region],
+        regionCode=region,
         operatingSystem=os,
         #        tenancy="shared",
         preInstalledSw="NA",
@@ -90,13 +91,11 @@ def ec2_filter(region, instance_type=None, os="Linux"):
 
 
 def ebs_filter(region, volume=None):
-    return fields(
-        location=REGIONS[region], productFamily="Storage", volumeApiName=volume
-    )
+    return fields(regionCode=region, productFamily="Storage", volumeApiName=volume)
 
 
-def iops_filter(region):
-    return fields(location=REGIONS[region], group="EBS IOPS")
+def iops_filter(region, volumeType):
+    return fields(regionCode=region, group="EBS IOPS", volumeApiName=volumeType)
 
 
 def extract_price(pricing_info):
@@ -130,8 +129,8 @@ def monthly_ec2_dollars(region: str, instance_type: str, tenancy: str = "default
     return ec2s[region][{"default": "Shared"}.get(tenancy, tenancy)][instance_type].usd
 
 
-def monthly_iops_dollars(region: str, iops: int) -> float:
-    return iopss[region] * iops
+def monthly_iops_dollars(region: str, volume: str, iops: int) -> float:
+    return iopss[region].get(volume, 0.0) * iops if iops else 0.0
 
 
 def get_zone_mapping() -> typing.Dict[str, str]:
@@ -162,7 +161,6 @@ class Inst(typing.NamedTuple):
 
 
 def get_instance_data(grouping_tags: typing.Tuple[str, str]):
-
     grouper = ",".join(f"Tags[?Key==`{t}`][].Value|[0]" for t in grouping_tags)
     query = (
         "Reservations[].Instances[].["
@@ -177,10 +175,11 @@ def get_instance_data(grouping_tags: typing.Tuple[str, str]):
         " Tags[].[@.Key, @.Value]"
         "]" % grouper
     )  # SecurityGroups[].[@.GroupName]
+    instances = ec2_client.describe_instances()
     return list(
         map(
             Inst._from_api_query,
-            jmespath.search(query, ec2_client.describe_instances()),
+            jmespath.search(query, instances),
         )
     )
 
@@ -230,7 +229,13 @@ def unlist(x):
 
 
 def iops_prices(regions):
-    return {r: extract_price(unlist(pricing_request(iops_filter(r)))) for r in regions}
+    return {
+        r: {
+            v: extract_price(unlist(pricing_request(iops_filter(r, v))))
+            for v in {"gp3", "io1", "io2"}
+        }
+        for r in regions
+    }
 
 
 class Ebs(typing.NamedTuple):
@@ -274,7 +279,7 @@ def get_ebs_data():
 def monthly_volume_dollars(region):
     def region_monthly_volume_dollars(volume_type, gb, iops):
         return monthly_ebs_dollars(region, volume_type, gb) + (
-            monthly_iops_dollars(region, iops) if volume_type == "io1" else 0
+            monthly_iops_dollars(region, volume_type, iops)
         )
 
     return region_monthly_volume_dollars
@@ -394,22 +399,34 @@ def parse(argv):
     return parser.parse_args()
 
 
+def cached_client(service, profile=None):
+    cache = os.path.join(os.path.expanduser("~"), ".aws/cli/cache")
+    provider = botocore.session.Session(profile=profile)
+    provider.get_component("credential_provider").get_provider(
+        "assume-role"
+    ).cache = botocore.credentials.JSONFileCache(cache)
+
+    return boto3.Session(botocore_session=provider).client(service)
+
+
 if __name__ == "__main__":
     tags = parse(sys.argv).tags.split(",")
     assert len(tags) == 2, "Currently need to supply exactly two tags"
     CACHE = os.getenv("XDG_HOME", os.path.expanduser("~/.config")) + f"ec2costs/cache"
     tic()
     # Why us-east-1? Well, the pricing service is only available in 2 regions.
-    pricing_client = boto3.client("pricing", region_name="us-east-1")
-    ec2_client = boto3.client("ec2")
+    pricing_client = boto3.Session(profile_name="default").client(
+        "pricing", region_name="us-east-1"
+    )
+    ec2_client = cached_client("ec2")
     ec2_client_region = ec2_client._client_config.region_name
-    cloudwatch_client = boto3.client("cloudwatch")
+    cloudwatch_client = cached_client("cloudwatch")
 
     toc("clients")
-    ec2_client_account_id = boto3.client("sts").get_caller_identity().get("Account")
+    ec2_client_account_id = cached_client("sts").get_caller_identity().get("Account")
     toc("account")
     cache_file = f"{CACHE}/{ec2_client_account_id}-{ec2_client_region}5.json"
-    if os.path.exists(cache_file):
+    if False and os.path.exists(cache_file):
         with open(cache_file) as fh:
             data = json.load(fh)
             ec2s = {
@@ -575,16 +592,22 @@ if __name__ == "__main__":
         f"100GiB gp2 (general purpose SSD) = {monthly_volume_dollars(region)('gp2', 100, None):6.2f}$, gives 300 IOPS = 256KiB reads or writes (non random 32KiB chunks can be batched)"
     )
     print(
+        f"100GiB gp3 (general purpose SSD) = {monthly_volume_dollars(region)('gp3', 100, None):6.2f}$, gives 3000 IOPS (FIXME details)"
+    )
+    print(
         f"100GiB io1 (paying for 300 IOPS) = {monthly_volume_dollars(region)('io1', 100, 300):6.2f}$, gives 300 IOPS = 256KiB reads or writes (non random 32KiB chunks can be batched)"
     )
     print(
-        f" 10GiB io1 (paying for 300 IOPS) = {monthly_volume_dollars(region)('io1',  10, 300):6.2f}$, gives 300 IOPS = 256KiB reads or writes (non random 32KiB chunks can be batched)"
+        f" 10GiB io2 (paying for 300 IOPS) = {monthly_volume_dollars(region)('io2',  10, 300):6.2f}$, gives 300 IOPS = 256KiB reads or writes (non random 32KiB chunks can be batched)"
     )
     print(
         f"So io1 is *insanely* expensive: even 10GiB at 300 IOPs would be some integer factor above gp2 for 100GiB and same IOPS"
     )
     print(
-        f"(For io1, each GiB costs you {monthly_ebs_dollars(region, 'io1', 1):5.3f} and you ADDITIONALLY pay {monthly_iops_dollars(region, 1):5.2f}$ per IOP capacity; only use if you exceed gp2 max IOPS or throughput)"
+        f"(For io1, each GiB costs you {monthly_ebs_dollars(region, 'io1', 1):5.3f} and you ADDITIONALLY pay {monthly_iops_dollars(region, 'io1', 1):5.2f}$ per IOP capacity; only use if you exceed gp2 max IOPS or throughput)"
+    )
+    print(
+        f"(For io2, each GiB costs you {monthly_ebs_dollars(region, 'io2', 1):5.3f} and you ADDITIONALLY pay {monthly_iops_dollars(region, 'io2', 1):5.2f}$ per IOP capacity; only use if you exceed gp2 max IOPS or throughput)"
     )
     print(
         f"(For gp2, each GiB costs you {monthly_ebs_dollars(region, 'gp2', 1):5.3f} and gives you 3 IOPs capacity for free)"
